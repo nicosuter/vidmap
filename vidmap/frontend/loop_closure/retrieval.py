@@ -148,65 +148,66 @@ def _load_descriptors(names, hfile):
     return torch.as_tensor(descriptors, dtype=torch.float)
 
 
-def _pairs_from_score_matrix(scores, invalid, num_select, min_score, return_scores):
-    invalid = torch.as_tensor(invalid, device=scores.device)
-    invalid |= scores < min_score
-    scores.masked_fill_(invalid, float("-inf"))
-    count = min(num_select, scores.shape[1])
-    indices_tensor = torch.argsort(scores, dim=1, descending=True, stable=True)[:, :count]
-    values_tensor = torch.gather(scores, 1, indices_tensor)
-    indices = indices_tensor.cpu().numpy()
-    values = values_tensor.cpu().numpy()
-    valid = values_tensor.isfinite().cpu().numpy()
-    pairs = []
-    for i, j in zip(*np.where(valid)):
-        pairs.append((i, indices[i, j], float(values[i, j])) if return_scores else (i, indices[i, j]))
-    return pairs
+def _excluded_pair_indices(sequence, excluded_pairs):
+    """Symmetric (row, col) sequence indices of excluded name pairs, sorted by row."""
+    seq_index = {name: idx for idx, name in enumerate(sequence)}
+    rows, cols = [], []
+    for pair in excluded_pairs:
+        if len(pair) != 2:
+            continue
+        name0, name1 = pair
+        if name0 in seq_index and name1 in seq_index:
+            rows += [seq_index[name0], seq_index[name1]]
+            cols += [seq_index[name1], seq_index[name0]]
+    rows, cols = np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64)
+    order = np.argsort(rows, kind="stable")
+    return rows[order], cols[order]
 
 
-def _retrieve_pairs(path, reference_query_dict, num_matched, min_score, return_scores, *, device: torch.device):
+def _retrieve_pairs(
+    path,
+    sequence,
+    excluded_pairs,
+    num_matched,
+    min_score,
+    return_scores,
+    *,
+    device: torch.device,
+):
+    """Top-``num_matched`` retrieval candidates per image among the non-excluded, non-self pairs.
+
+    Scores the descriptor matrix in row chunks; candidate order and tie-breaking match a per-image
+    stable sort over the remaining images in sequence order.
+    """
     with h5py.File(str(path), "r", libver="latest") as hfile:
-
-        def has_descriptor(name):
-            return name in hfile and "global_descriptor" in hfile[name]
-
-        references = [name for name in reference_query_dict if has_descriptor(name)]
-        queries = list(
-            dict.fromkeys(
-                query for candidates in reference_query_dict.values() for query in candidates if has_descriptor(query)
-            )
-        )
-        if not references or not queries:
+        names = [name for name in sequence if name in hfile and "global_descriptor" in hfile[name]]
+        if not names:
             return []
-        reference_descriptors = _load_descriptors(references, hfile).to(device)
-        query_descriptors = _load_descriptors(queries, hfile).to(device)
-    reference_indices = {name: index for index, name in enumerate(references)}
-    query_indices = {name: index for index, name in enumerate(queries)}
+        descriptors = _load_descriptors(names, hfile).to(device)
+    rows, cols = _excluded_pair_indices(names, excluded_pairs)
+    count = min(num_matched, len(names))
+    chunk = max(1, 2**25 // len(names))
     pairs = []
-    for reference, candidates in reference_query_dict.items():
-        if reference not in reference_indices:
-            continue
-        valid_queries = [query for query in candidates if query in query_indices]
-        if not valid_queries:
-            continue
-        reference_descriptor = reference_descriptors[reference_indices[reference] : reference_indices[reference] + 1]
-        candidate_descriptors = query_descriptors[[query_indices[query] for query in valid_queries]]
-        similarities = torch.einsum("id,jd->ij", reference_descriptor, candidate_descriptors)
-        self_mask = np.array([reference])[:, None] == np.array(valid_queries)[None]
-        pair_indices = _pairs_from_score_matrix(
-            similarities,
-            self_mask,
-            num_matched,
-            min_score,
-            return_scores,
-        )
-        for pair in pair_indices:
-            if return_scores:
-                _, query_index, score = pair
-                pairs.append((reference, valid_queries[query_index], score))
-            else:
-                _, query_index = pair
-                pairs.append((reference, valid_queries[query_index]))
+    for start in range(0, len(names), chunk):
+        stop = min(start + chunk, len(names))
+        scores = descriptors[start:stop] @ descriptors.T
+        invalid = scores < min_score
+        local = torch.arange(stop - start, device=device)
+        invalid[local, local + start] = True
+        lo, hi = np.searchsorted(rows, [start, stop])
+        if hi > lo:
+            invalid[
+                torch.as_tensor(rows[lo:hi] - start, device=device),
+                torch.as_tensor(cols[lo:hi], device=device),
+            ] = True
+        scores.masked_fill_(invalid, float("-inf"))
+        indices = torch.argsort(scores, dim=1, descending=True, stable=True)[:, :count]
+        values = torch.gather(scores, 1, indices)
+        valid = values.isfinite().cpu().numpy()
+        indices, values = indices.cpu().numpy(), values.cpu().numpy()
+        for i, j in zip(*np.where(valid)):
+            reference, query = names[start + i], names[indices[i, j]]
+            pairs.append((reference, query, float(values[i, j])) if return_scores else (reference, query))
     return pairs
 
 
@@ -227,24 +228,18 @@ def generate_retrieval_pairs(
     if not retrieval_path.exists():
         raise ValueError("Retrieval features not found. Run compute_retrieval_features step first.")
 
-    sequential_pairs_set = {frozenset(pair) for pair in sequential_pairs}
-    tcorr_pairs_set = {frozenset(pair) for pair, matches in tcorr.items() if len(matches) > tcorr_min_matches}
-    untracked_pairs = defaultdict(list)
-    for id_a in range(len(sequence)):
-        for id_b in range(len(sequence)):
-            if id_a == id_b:
-                continue
-            pair = frozenset([sequence[id_a], sequence[id_b]])
-            if pair not in tcorr_pairs_set and pair not in sequential_pairs_set:
-                untracked_pairs[sequence[id_a]].append(sequence[id_b])
-
-    if not untracked_pairs:
+    excluded_pairs = {frozenset(pair) for pair in sequential_pairs}
+    excluded_pairs |= {frozenset(pair) for pair, matches in tcorr.items() if len(matches) > tcorr_min_matches}
+    images = set(sequence)
+    num_excluded = sum(1 for pair in excluded_pairs if len(pair) == 2 and pair <= images)
+    if num_excluded == len(images) * (len(images) - 1) // 2:
         logger.info("No untracked pairs found for retrieval")
         return []
 
     retrieval_pairs = _retrieve_pairs(
         retrieval_path,
-        untracked_pairs,
+        sequence,
+        excluded_pairs,
         nquery,
         retrieval_min_score,
         lc_pair_nms,
@@ -291,15 +286,21 @@ def endpoint_nms_retrieval_pairs(scored_pairs, sequence, radius):
         ((score, endpoints, pair) for pair, (score, endpoints) in best_by_pair.items()),
         key=lambda item: (-item[0], item[2][0], item[2][1]),
     )
+    # Accepted endpoints bucketed into (radius + 1)-sized cells: anything within the radius
+    # lies in the 3x3 neighboring cells, so each candidate checks a few entries instead of all.
+    cell = radius + 1
     accepted = []
-    accepted_endpoints = []
-    for _score, endpoints, pair in candidates:
+    accepted_cells = defaultdict(list)
+    for _score, (idx0, idx1), pair in candidates:
+        cell0, cell1 = idx0 // cell, idx1 // cell
         suppress = any(
-            abs(endpoints[0] - previous[0]) <= radius and abs(endpoints[1] - previous[1]) <= radius
-            for previous in accepted_endpoints
+            abs(idx0 - prev0) <= radius and abs(idx1 - prev1) <= radius
+            for d0 in (-1, 0, 1)
+            for d1 in (-1, 0, 1)
+            for prev0, prev1 in accepted_cells.get((cell0 + d0, cell1 + d1), ())
         )
         if suppress:
             continue
         accepted.append(pair)
-        accepted_endpoints.append(endpoints)
+        accepted_cells[(cell0, cell1)].append((idx0, idx1))
     return natsorted(accepted)
